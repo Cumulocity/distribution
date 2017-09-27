@@ -73,7 +73,6 @@ func New(url, databaseName string) (*Driver, error) {
 		return nil, err
 	}
 
-	// Optional. Switch the session to a monotonic behavior.
 	session.SetMode(mgo.Monotonic, true)
 
 	d := &driver{
@@ -105,6 +104,10 @@ func (d *driver) GetContent(ctx context.Context, path string) ([]byte, error) {
 
 // PutContent stores the []byte content at a location designated by "path".
 func (d *driver) PutContent(ctx context.Context, p string, contents []byte) error {
+	deleteErr := d.GridFS().Remove(p)
+	if deleteErr != nil {
+		return deleteErr
+	}
 	file, err := d.GridFS().Create(p)
 	if err != nil {
 		return err
@@ -139,8 +142,7 @@ func (d *driver) Reader(ctx context.Context, path string, offset int64) (io.Read
 	if err != nil {
 		return nil, err
 	}
-
-	return ioutil.NopCloser(file), nil
+	return file, nil
 }
 
 // Writer returns a FileWriter which will store the content written to it
@@ -249,11 +251,9 @@ func (d *driver) Move(ctx context.Context, sourcePath string, destPath string) e
 	if err != nil {
 		return err
 	}
-	sourceFile, err := d.GridFS().Open(sourcePath)
+	sourceFile, err := d.Reader(ctx, sourcePath, 0)
 	if err != nil {
-		if err == mgo.ErrNotFound {
-			return storagedriver.PathNotFoundError{Path: sourcePath}
-		}
+		return err
 	}
 	defer sourceFile.Close()
 	_, copyErr := io.Copy(destFile, sourceFile)
@@ -281,7 +281,7 @@ func (d *driver) Delete(ctx context.Context, path string) error {
 		return storagedriver.PathNotFoundError{Path: path}
 	}
 	for _, file := range files {
-		err := d.GridFS().Remove(file.Filename)
+		err := d.GridFS().RemoveId(file.ID)
 		if err != nil {
 			return err
 		}
