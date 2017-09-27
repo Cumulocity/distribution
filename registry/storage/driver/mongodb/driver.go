@@ -95,8 +95,11 @@ func (d *driver) GetContent(ctx context.Context, path string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rc.Close()
 	result, err := ioutil.ReadAll(rc)
+	closeErr := rc.Close()
+	if closeErr != nil {
+		return nil, closeErr
+	}
 	return result, err
 }
 
@@ -178,13 +181,15 @@ func (d *driver) Stat(ctx context.Context, path string) (storagedriver.FileInfo,
 		}
 		return nil, err
 	}
-	defer file.Close()
-
 	fi := storagedriver.FileInfoFields{
 		Path:    path,
 		IsDir:   false,
 		ModTime: file.UploadDate(),
 		Size:    file.Size(),
+	}
+	closeErr := file.Close()
+	if closeErr != nil {
+		return nil, closeErr
 	}
 	return storagedriver.FileInfoInternal{FileInfoFields: fi}, nil
 }
