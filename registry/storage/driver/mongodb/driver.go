@@ -1,6 +1,7 @@
 package mongodb
 
 import (
+	"errors"
 	"fmt"
 	"github.com/docker/distribution/context"
 	storagedriver "github.com/docker/distribution/registry/storage/driver"
@@ -10,6 +11,7 @@ import (
 	"gopkg.in/mgo.v2/bson"
 	"io"
 	"io/ioutil"
+	"strconv"
 	"strings"
 )
 
@@ -40,10 +42,28 @@ type Driver struct {
 	baseEmbed // embedded, hidden base driver.
 }
 
-type mgoFile struct {
+type gridFsEntry struct {
 	ID       bson.ObjectId `bson:"_id,omitempty"`
 	Filename string
 	Length   int64
+}
+
+type databaseConfigEntry struct {
+	ID          bson.ObjectId `bson:"_id,omitempty"`
+	Partitioned bool
+}
+
+type collectionsConfigEntry struct {
+	ID string `bson:"_id"`
+}
+
+type serverStatusEntry struct {
+	Process string
+}
+
+type driverMode struct {
+	consistencyMode int
+	refresh         bool
 }
 
 var _ storagedriver.StorageDriver = &Driver{}
@@ -58,28 +78,170 @@ func FromParameters(parameters map[string]interface{}) (*Driver, error) {
 	if !ok || fmt.Sprint(url) == "" {
 		return nil, fmt.Errorf("No 'url' parameter provided")
 	}
-	databaseName, ok := parameters["databaseName"]
+	databaseName, ok := parameters["dbname"]
 	if !ok || fmt.Sprint(databaseName) == "" {
 		databaseName = "docker"
 	}
 
-	return New(fmt.Sprint(url), fmt.Sprint(databaseName))
+	mode, ok := parameters["dbmode"]
+	if ok {
+		dbMode := 2
+		modeAsInt, err := strconv.Atoi(fmt.Sprint(mode))
+		if err == nil {
+			dbMode = modeAsInt
+		}
+
+		dbRefresh := false
+		refresh, ok := parameters["dbrefresh"]
+		if ok {
+			refreshAsBool, err := strconv.ParseBool(fmt.Sprint(refresh))
+			if err == nil {
+				dbRefresh = refreshAsBool
+			}
+		}
+		return New(fmt.Sprint(url), fmt.Sprint(databaseName), &driverMode{
+			consistencyMode: dbMode,
+			refresh:         dbRefresh,
+		})
+	}
+	return New(fmt.Sprint(url), fmt.Sprint(databaseName), nil)
 }
 
 // New constructs a new Driver.
-func New(url, databaseName string) (*Driver, error) {
+func New(url, databaseName string, mode *driverMode) (*Driver, error) {
 	session, err := mgo.Dial(url)
 	if err != nil {
 		return nil, err
 	}
 
-	session.SetMode(mgo.Monotonic, true)
+	if mode != nil {
+		session.SetMode(mgo.Mode(mode.consistencyMode), mode.refresh)
+	}
 
 	d := &driver{
 		session: session,
 		db:      session.DB(databaseName),
 	}
+	isShard, err := isShardEnvironment(d)
+	if err != nil {
+		return nil, err
+	}
+	if isShard {
+		err := initShard(d)
+		if err != nil {
+			return nil, err
+		}
+	}
 	return &Driver{baseEmbed: baseEmbed{Base: base.Base{StorageDriver: d}}}, nil
+}
+
+func isShardEnvironment(d *driver) (bool, error) {
+	var serverStatus serverStatusEntry
+	err := d.session.DB("admin").Run(bson.M{"serverStatus": 1}, &serverStatus)
+	if err != nil {
+		return false, err
+	}
+	return serverStatus.Process == "mongos", nil
+}
+
+func initShard(d *driver) error {
+	err := createGridFSDatabase(d)
+	if err != nil {
+		return err
+	}
+	err = enableDatabaseSharding(d)
+	if err != nil {
+		return err
+	}
+	err = createShardKeys(d)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func createGridFSDatabase(d *driver) error {
+	count, err := d.GridFS().Find(bson.M{}).Count()
+	if err != nil {
+		return err
+	}
+	if count == 0 {
+		tempContent := make([]byte, 2)
+		tempFilename := "temp_file"
+		err := d.PutContent(nil, tempFilename, tempContent)
+		if err != nil {
+			return err
+		}
+		e := d.Delete(nil, tempFilename)
+		if e != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func enableDatabaseSharding(d *driver) error {
+	var configEntries []databaseConfigEntry
+	findConfigError := d.session.DB("config").C("databases").Find(bson.M{"_id": d.db.Name}).All(&configEntries)
+	if findConfigError != nil {
+		return findConfigError
+	}
+	if len(configEntries) != 1 {
+		return storagedriver.Error{
+			DriverName: d.Name(),
+			Enclosed:   errors.New("Cannot find database '" + d.db.Name + "' configuration"),
+		}
+	}
+	if !configEntries[0].Partitioned {
+		result := bson.M{}
+		err := d.session.DB("admin").Run(bson.M{"enableSharding": d.db.Name}, &result)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func createShardKeys(d *driver) error {
+	chunksCollection := d.db.Name + "." + fs + ".chunks"
+	err := createShardKey(d, chunksCollection, bson.D{
+		{Name: "shardCollection", Value: chunksCollection},
+		{Name: "key", Value: bson.D{
+			{Name: "files_id", Value: 1},
+			{Name: "n", Value: 1},
+		}},
+	})
+	if err != nil {
+		return err
+	}
+
+	filesCollection := d.db.Name + "." + fs + ".files"
+	err = createShardKey(d, filesCollection, bson.D{
+		{Name: "shardCollection", Value: filesCollection},
+		{Name: "key", Value: bson.D{
+			{Name: "_id", Value: 1},
+		}},
+	})
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func createShardKey(d *driver, collectionName string, shardKeyCmd interface{}) error {
+	result := bson.M{}
+	var existingShardKeys []collectionsConfigEntry
+	err := d.session.DB("config").C("collections").Find(bson.M{"_id": collectionName}).All(&existingShardKeys)
+	if err != nil {
+		return err
+	}
+	if len(existingShardKeys) == 0 {
+		err := d.session.DB("admin").Run(shardKeyCmd, &result)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // Implement the storagedriver.StorageDriver interface.
@@ -197,7 +359,7 @@ func (d *driver) Stat(ctx context.Context, path string) (storagedriver.FileInfo,
 }
 
 func dirStat(d *driver, path string) (storagedriver.FileInfo, error) {
-	var files []mgoFile
+	var files []gridFsEntry
 	findErr := d.GridFS().Find(bson.M{"filename": bson.M{"$regex": bson.RegEx{Pattern: path + ".*"}}}).All(&files)
 	if findErr != nil {
 		return nil, findErr
@@ -215,7 +377,7 @@ func dirStat(d *driver, path string) (storagedriver.FileInfo, error) {
 // List returns a list of the objects that are direct descendants of the given
 // path.
 func (d *driver) List(ctx context.Context, path string) ([]string, error) {
-	var files []mgoFile
+	var files []gridFsEntry
 	if !strings.HasSuffix(path, separator) {
 		path += separator
 	}
@@ -269,7 +431,7 @@ func (d *driver) Move(ctx context.Context, sourcePath string, destPath string) e
 
 // Delete recursively deletes all objects stored at "path" and its subpaths.
 func (d *driver) Delete(ctx context.Context, path string) error {
-	var files []mgoFile
+	var files []gridFsEntry
 	err := d.GridFS().Find(bson.M{"$or": []bson.M{
 		{"filename": bson.M{"$regex": bson.RegEx{Pattern: path + "/.*"}}},
 		{"filename": bson.M{"$eq": path}},

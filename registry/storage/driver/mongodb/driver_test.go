@@ -38,7 +38,7 @@ func init() {
 	}
 
 	mongodbDriverConstructor := func() (storagedriver.StorageDriver, error) {
-		return New(mongodbURL, "docker_registry_test")
+		return New(mongodbURL, "docker_registry_test", nil)
 	}
 
 	// Skip MongoDB storage driver tests if environment variable parameters are not provided
